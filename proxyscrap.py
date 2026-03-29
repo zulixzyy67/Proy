@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Proxy Scraper Telegram Bot v4 — Improved
+Proxy Scraper Telegram Bot v3 — Ping-Quality Focused
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Fixes & Improvements over v3:
-  ✅ Bug fix: /top works after URL scrape & free source scans
-  ✅ Bug fix: aiohttp ClientSession reused per test-run (no leak)
-  ✅ Bug fix: Settings persist across bot restarts (user_settings.json)
-  ✅ New: /cancel command to abort running scans
-  ✅ New: Duplicate scan prevention per user
-  ✅ New: Global error handler for unhandled exceptions
-  ✅ Perf: Auto-mode tries all protocols IN PARALLEL (3x faster)
-  ✅ Perf: Shared TCPConnector for all concurrent HTTP probes
-  ✅ UX: URL validation uses proper regex (not just startswith)
-  ✅ UX: Progress message shows /cancel hint
+New in v3 (all real, no placeholders):
+  • Two-phase testing: quick filter (short timeout) → multi-sample on survivors
+  • Per-proxy multi-sample ping (configurable 1–5 samples)
+  • Jitter calculation (std-dev of samples) → stable vs unstable flag
+  • Ping Score = weighted average of ping + jitter penalty
+  • Ping Tiers: Elite (<200ms) / Good (200–500ms) / Medium (500–1000ms) / Slow (>1s)
+  • Per-tier export files sent separately
+  • Max-ping filter: drop proxies above user threshold
+  • /top N command — fastest N proxies inline
+  • Quick-filter phase uses short timeout to skip obviously dead proxies fast
+  • Settings: max_ping, samples, quick_timeout, tier_export on/off
 """
 
 import asyncio
@@ -51,21 +51,21 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-PROGRESS_MIN_GAP   = 3.0
-QUICK_TIMEOUT      = 4
-DEFAULT_TIMEOUT    = 10
-DEFAULT_CONCUR     = 100
-DEFAULT_SAMPLES    = 2
-DEFAULT_MAX_PING   = 2000
+PROGRESS_MIN_GAP   = 3.0      # min seconds between Telegram edits
+QUICK_TIMEOUT      = 4        # phase-1 quick-filter timeout (seconds)
+DEFAULT_TIMEOUT    = 10       # phase-2 full test timeout
+DEFAULT_CONCUR     = 100      # semaphore concurrency
+DEFAULT_SAMPLES    = 2        # how many ping samples per alive proxy
+DEFAULT_MAX_PING   = 2000     # drop proxies slower than this (ms), 0 = no limit
 DEFAULT_TEST_URL   = "http://httpbin.org/ip"
-FALLBACK_TEST_URLS = [
+FALLBACK_TEST_URLS = [        # rotated if primary fails
     "http://ip-api.com/json",
     "http://checkip.amazonaws.com",
     "http://ifconfig.me/ip",
 ]
-SETTINGS_FILE = "user_settings.json"   # ✅ Persistence file
 
 # ─── Ping Tiers ───────────────────────────────────────────────────────────────
+# (label, max_ms, emoji)
 TIERS = [
     ("elite",  200,  "🚀"),
     ("good",   500,  "✅"),
@@ -74,6 +74,7 @@ TIERS = [
 ]
 
 def ping_tier(ms: Optional[int]) -> tuple[str, str]:
+    """Return (tier_name, emoji) for a given response_ms."""
     if ms is None:
         return ("dead", "💀")
     for name, limit, emoji in TIERS:
@@ -147,14 +148,16 @@ class ProxyResult:
     proxy:        str
     protocol:     str  = "unknown"
     alive:        bool = False
-    response_ms:  Optional[int]       = None
-    avg_ms:       Optional[int]       = None
-    jitter_ms:    Optional[int]       = None
-    ping_samples: list = field(default_factory=list)
-    ping_score:   float = 9999.0
-    tier:         str  = "dead"
+    # ── Ping quality fields ──────────────────────────────────────
+    response_ms:  Optional[int]       = None   # best ping sample
+    avg_ms:       Optional[int]       = None   # mean of all samples
+    jitter_ms:    Optional[int]       = None   # std-dev of samples (stability)
+    ping_samples: list = field(default_factory=list)  # raw sample list
+    ping_score:   float = 9999.0               # lower = better (ms + jitter)
+    tier:         str  = "dead"                # elite/good/medium/slow/dead
     tier_emoji:   str  = "💀"
-    stable:       bool = False
+    stable:       bool = False                 # jitter < 100ms
+    # ── Geo fields ───────────────────────────────────────────────
     country:      str  = ""
     country_flag: str  = ""
     city:         str  = ""
@@ -163,16 +166,18 @@ class ProxyResult:
     error:        str  = ""
 
     def finalize_ping(self) -> None:
+        """Compute avg, jitter, score, tier from ping_samples."""
         s = self.ping_samples
         if not s:
             return
         self.response_ms = min(s)
         self.avg_ms      = int(sum(s) / len(s))
         if len(s) > 1:
-            mean = sum(s) / len(s)
+            mean   = sum(s) / len(s)
             self.jitter_ms = int(math.sqrt(sum((x - mean)**2 for x in s) / len(s)))
         else:
             self.jitter_ms = 0
+        # Score: avg + 50% jitter penalty
         self.ping_score = self.avg_ms + self.jitter_ms * 0.5
         self.tier, self.tier_emoji = ping_tier(self.response_ms)
         self.stable = (self.jitter_ms is not None and self.jitter_ms < 100)
@@ -183,61 +188,12 @@ class UserSettings:
     timeout:       int   = DEFAULT_TIMEOUT
     quick_timeout: int   = QUICK_TIMEOUT
     concur:        int   = DEFAULT_CONCUR
-    samples:       int   = DEFAULT_SAMPLES
-    max_ping:      int   = DEFAULT_MAX_PING
+    samples:       int   = DEFAULT_SAMPLES    # ping samples per proxy
+    max_ping:      int   = DEFAULT_MAX_PING   # 0 = no limit
     test_url:      str   = DEFAULT_TEST_URL
     geo_lookup:    bool  = True
-    export_fmt:    str   = "txt"
-    tier_export:   bool  = True
-
-# ─── Settings Persistence ─────────────────────────────────────────────────────
-_USER_SETTINGS: dict[int, UserSettings] = {}
-
-def _settings_to_dict(s: UserSettings) -> dict:
-    return {
-        "timeout": s.timeout, "quick_timeout": s.quick_timeout,
-        "concur": s.concur, "samples": s.samples, "max_ping": s.max_ping,
-        "test_url": s.test_url, "geo_lookup": s.geo_lookup,
-        "export_fmt": s.export_fmt, "tier_export": s.tier_export,
-    }
-
-def _settings_from_dict(d: dict) -> UserSettings:
-    s = UserSettings()
-    for k, v in d.items():
-        if hasattr(s, k):
-            try:
-                setattr(s, k, v)
-            except Exception:
-                pass
-    return s
-
-def load_all_settings() -> None:
-    """Load persisted user settings from JSON file on startup."""
-    global _USER_SETTINGS
-    if not os.path.exists(SETTINGS_FILE):
-        return
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        _USER_SETTINGS = {int(uid): _settings_from_dict(d) for uid, d in data.items()}
-        logger.info(f"✅ Loaded settings for {len(_USER_SETTINGS)} users")
-    except Exception as e:
-        logger.warning(f"load_settings failed: {e}")
-
-def save_all_settings() -> None:
-    """Persist all user settings to JSON file."""
-    try:
-        data = {str(uid): _settings_to_dict(s) for uid, s in _USER_SETTINGS.items()}
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"save_settings failed: {e}")
-
-def get_settings(uid: int) -> UserSettings:
-    return _USER_SETTINGS.setdefault(uid, UserSettings())
-
-# ─── Active Task Tracking (for /cancel) ───────────────────────────────────────
-_ACTIVE_TASKS: dict[int, asyncio.Task] = {}
+    export_fmt:    str   = "txt"             # txt / csv / json
+    tier_export:   bool  = True              # send per-tier files
 
 # ─── IP Utilities ─────────────────────────────────────────────────────────────
 _PROXY_RE = re.compile(
@@ -326,28 +282,24 @@ async def fetch(url: str, timeout: int = 20, return_json: bool = False):
         logger.debug(f"fetch({url}): {e}")
         return None
 
-# ─── Core Ping Functions ──────────────────────────────────────────────────────
-async def _ping_http(
-    session: aiohttp.ClientSession,   # ✅ Shared session — no per-request creation
-    proxy: str, url: str, timeout: int,
-) -> Optional[int]:
-    """HTTP probe using shared session. Returns ms or None."""
+# ─── Core Single-shot Ping ────────────────────────────────────────────────────
+async def _ping_http(proxy: str, url: str, timeout: int) -> Optional[int]:
+    """One HTTP probe. Returns ms or None."""
     t0 = time.perf_counter()
     try:
-        async with session.get(
-            url, proxy=f"http://{proxy}",
-            timeout=aiohttp.ClientTimeout(total=timeout),
-            ssl=False,
-        ) as r:
-            if r.status < 500:
-                await r.read()
-                return int((time.perf_counter() - t0) * 1000)
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, proxy=f"http://{proxy}",
+                             timeout=aiohttp.ClientTimeout(total=timeout),
+                             ssl=False) as r:
+                if r.status < 500:          # accept 200–4xx (proxy is alive)
+                    await r.read()          # ensure full round-trip measured
+                    return int((time.perf_counter() - t0) * 1000)
     except Exception:
         pass
     return None
 
 async def _ping_socks(proxy: str, ptype: ProxyType, url: str, timeout: int) -> Optional[int]:
-    """SOCKS probe — needs its own connector per proxy (aiohttp_socks requirement)."""
+    """One SOCKS probe. Returns ms or None."""
     ip, port = proxy.rsplit(":", 1)
     t0 = time.perf_counter()
     try:
@@ -364,12 +316,20 @@ async def _ping_socks(proxy: str, ptype: ProxyType, url: str, timeout: int) -> O
 
 # ─── Multi-sample Ping ────────────────────────────────────────────────────────
 async def _collect_samples(
-    session: aiohttp.ClientSession,
-    proxy: str, protocol: str, test_url: str, timeout: int, n: int,
+    proxy: str,
+    protocol: str,
+    test_url: str,
+    timeout: int,
+    n: int,
 ) -> list[int]:
-    """Run n ping probes sequentially. Returns list of successful ms values."""
-    urls    = [test_url] + [u for u in FALLBACK_TEST_URLS if u != test_url]
+    """
+    Run n ping probes sequentially (0.1s gap between samples to avoid false hits).
+    Returns list of successful ms values (may be shorter than n if some fail).
+    Uses a rotating URL list so the same endpoint isn't hammered.
+    """
+    urls = [test_url] + [u for u in FALLBACK_TEST_URLS if u != test_url]
     samples = []
+
     for i in range(n):
         url = urls[i % len(urls)]
         if protocol == "socks5":
@@ -377,79 +337,77 @@ async def _collect_samples(
         elif protocol == "socks4":
             ms = await _ping_socks(proxy, ProxyType.SOCKS4, url, timeout)
         else:
-            ms = await _ping_http(session, proxy, url, timeout)
+            ms = await _ping_http(proxy, url, timeout)
+
         if ms is not None:
             samples.append(ms)
         if i < n - 1:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.1)    # brief gap between samples
+
     return samples
 
 # ─── Phase 1: Quick Filter ────────────────────────────────────────────────────
 async def _quick_probe(
-    session: aiohttp.ClientSession,
-    proxy: str, hint_type: str, test_url: str, quick_timeout: int,
+    proxy: str,
+    hint_type: str,
+    test_url: str,
+    quick_timeout: int,
     sem: asyncio.Semaphore,
 ) -> Optional[tuple[str, int]]:
     """
-    Quick single-shot probe.
-    ✅ For 'auto' mode: tries http / socks5 / socks4 IN PARALLEL
-       (v3 tried them sequentially — 3x slower on dead proxies).
-    Returns (protocol, ms) or None.
+    Quick single-shot probe with short timeout.
+    Returns (protocol, ms) if alive, else None.
+    Tries protocols in order and returns on first success.
     """
     async with sem:
+        order = []
         if hint_type in ("http", "https"):
-            ms = await _ping_http(session, proxy, test_url, quick_timeout)
-            return ("http", ms) if ms is not None else None
-
+            order = [("http", None)]
         elif hint_type == "socks4":
-            ms = await _ping_socks(proxy, ProxyType.SOCKS4, test_url, quick_timeout)
-            return ("socks4", ms) if ms is not None else None
-
+            order = [("socks4", ProxyType.SOCKS4)]
         elif hint_type == "socks5":
-            ms = await _ping_socks(proxy, ProxyType.SOCKS5, test_url, quick_timeout)
-            return ("socks5", ms) if ms is not None else None
+            order = [("socks5", ProxyType.SOCKS5)]
+        else:   # auto
+            order = [
+                ("http",   None),
+                ("socks5", ProxyType.SOCKS5),
+                ("socks4", ProxyType.SOCKS4),
+            ]
 
-        else:  # auto — ✅ PARALLEL detection
-            async def try_http():
-                ms = await _ping_http(session, proxy, test_url, quick_timeout)
-                return ("http", ms) if ms is not None else None
-
-            async def try_socks5():
-                ms = await _ping_socks(proxy, ProxyType.SOCKS5, test_url, quick_timeout)
-                return ("socks5", ms) if ms is not None else None
-
-            async def try_socks4():
-                ms = await _ping_socks(proxy, ProxyType.SOCKS4, test_url, quick_timeout)
-                return ("socks4", ms) if ms is not None else None
-
-            results = await asyncio.gather(
-                try_http(), try_socks5(), try_socks4(),
-                return_exceptions=True,
-            )
-            # Return the fastest successful result
-            best: Optional[tuple[str, int]] = None
-            for r in results:
-                if isinstance(r, tuple) and r[1] is not None:
-                    if best is None or r[1] < best[1]:
-                        best = r
-            return best
+        for proto, ptype in order:
+            if ptype is None:
+                ms = await _ping_http(proxy, test_url, quick_timeout)
+            else:
+                ms = await _ping_socks(proxy, ptype, test_url, quick_timeout)
+            if ms is not None:
+                return (proto, ms)
+    return None
 
 # ─── Phase 2: Full Multi-sample Test ─────────────────────────────────────────
 async def _full_test(
-    session: aiohttp.ClientSession,
-    proxy: str, protocol: str, first_ms: int,
-    settings: UserSettings, sem: asyncio.Semaphore,
+    proxy: str,
+    protocol: str,
+    first_ms: int,
+    settings: UserSettings,
+    sem: asyncio.Semaphore,
 ) -> ProxyResult:
+    """
+    For a proxy that passed quick-filter: collect N samples, compute quality.
+    first_ms is injected as the first sample (already measured in phase 1).
+    """
     r = ProxyResult(proxy=proxy, protocol=protocol, alive=True)
+
     async with sem:
         if settings.samples <= 1:
             r.ping_samples = [first_ms]
         else:
+            # collect (samples-1) more, then prepend the first
             extras = await _collect_samples(
-                session, proxy, protocol,
-                settings.test_url, settings.timeout, settings.samples - 1,
+                proxy, protocol, settings.test_url,
+                settings.timeout, settings.samples - 1,
             )
             r.ping_samples = [first_ms] + extras
+
     r.finalize_ping()
     return r
 
@@ -460,69 +418,70 @@ async def run_tests(
     progress_cb=None,
 ) -> list[ProxyResult]:
     """
-    Phase 1 — quick filter (parallel protocol detection for 'auto').
-    Phase 2 — multi-sample ping on survivors.
-    ✅ ONE shared TCPConnector/Session for all HTTP probes (no per-request leak).
+    Phase 1 — quick filter (short timeout, all proxies, high concurrency).
+    Phase 2 — multi-sample ping only on survivors.
+    Returns list of ProxyResult sorted by ping_score.
     """
     total    = len(proxies)
     sem_fast = asyncio.Semaphore(settings.concur)
-    sem_deep = asyncio.Semaphore(max(20, settings.concur // 4))
+    sem_deep = asyncio.Semaphore(max(20, settings.concur // 4))  # fewer for multi-sample
 
     dead_results:  list[ProxyResult] = []
-    phase1_passed: list[tuple[str, str, int]] = []
-    done    = [0]
-    lock    = asyncio.Lock()
+    phase1_passed: list[tuple[str, str, int]] = []   # (proxy, proto, ms)
+    done = [0]
+    lock = asyncio.Lock()
     last_cb = [0.0]
 
-    # ✅ Single shared connector for ALL HTTP proxy probes this run
-    connector = aiohttp.TCPConnector(limit=settings.concur + 50, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as http_session:
-
-        # ── Phase 1 ─────────────────────────────────────────────────
-        async def quick_one(proxy: str, hint: str) -> None:
-            result = await _quick_probe(
-                http_session, proxy, hint,
-                settings.test_url, settings.quick_timeout, sem_fast,
-            )
-            async with lock:
-                done[0] += 1
-                if result:
-                    proto, ms = result
-                    if settings.max_ping > 0 and ms > settings.max_ping:
-                        dead_results.append(ProxyResult(
-                            proxy=proxy, protocol=proto, alive=False,
-                            error=f"ping {ms}ms > max {settings.max_ping}ms",
-                        ))
-                    else:
-                        phase1_passed.append((proxy, proto, ms))
+    # ── Phase 1 ───────────────────────────────────────────────────
+    async def quick_one(proxy: str, hint: str) -> None:
+        result = await _quick_probe(
+            proxy, hint, settings.test_url, settings.quick_timeout, sem_fast
+        )
+        async with lock:
+            done[0] += 1
+            if result:
+                proto, ms = result
+                # Apply max_ping filter immediately
+                if settings.max_ping > 0 and ms > settings.max_ping:
+                    dead_results.append(ProxyResult(
+                        proxy=proxy, protocol=proto, alive=False,
+                        error=f"ping {ms}ms > max {settings.max_ping}ms",
+                    ))
                 else:
-                    dead_results.append(ProxyResult(proxy=proxy, alive=False))
+                    phase1_passed.append((proxy, proto, ms))
+            else:
+                dead_results.append(ProxyResult(proxy=proxy, alive=False))
 
-                now = time.monotonic()
-                if progress_cb and (now - last_cb[0] >= PROGRESS_MIN_GAP or done[0] == total):
-                    last_cb[0] = now
-                    await progress_cb("phase1", done[0], total, len(phase1_passed))
+            now = time.monotonic()
+            if progress_cb and (now - last_cb[0] >= PROGRESS_MIN_GAP or done[0] == total):
+                last_cb[0] = now
+                await progress_cb(
+                    "phase1", done[0], total, len(phase1_passed)
+                )
 
-        await asyncio.gather(*[quick_one(p, h) for p, h in proxies])
+    await asyncio.gather(*[quick_one(p, h) for p, h in proxies])
 
-        # ── Phase 2 ─────────────────────────────────────────────────
-        alive_results: list[ProxyResult] = []
-        p2_done  = [0]
-        p2_total = len(phase1_passed)
+    # ── Phase 2 ───────────────────────────────────────────────────
+    alive_results: list[ProxyResult] = []
+    p2_done = [0]
+    p2_total = len(phase1_passed)
 
-        async def deep_one(proxy: str, proto: str, first_ms: int) -> None:
-            r = await _full_test(http_session, proxy, proto, first_ms, settings, sem_deep)
-            async with lock:
-                alive_results.append(r)
-                p2_done[0] += 1
-                now = time.monotonic()
-                if progress_cb and (now - last_cb[0] >= PROGRESS_MIN_GAP or p2_done[0] == p2_total):
-                    last_cb[0] = now
-                    await progress_cb("phase2", p2_done[0], p2_total, len(alive_results))
+    async def deep_one(proxy: str, proto: str, first_ms: int) -> None:
+        r = await _full_test(proxy, proto, first_ms, settings, sem_deep)
+        async with lock:
+            alive_results.append(r)
+            p2_done[0] += 1
+            now = time.monotonic()
+            if progress_cb and (now - last_cb[0] >= PROGRESS_MIN_GAP or p2_done[0] == p2_total):
+                last_cb[0] = now
+                await progress_cb(
+                    "phase2", p2_done[0], p2_total, len(alive_results)
+                )
 
-        if phase1_passed:
-            await asyncio.gather(*[deep_one(p, r, m) for p, r, m in phase1_passed])
+    if phase1_passed:
+        await asyncio.gather(*[deep_one(p, r, m) for p, r, m in phase1_passed])
 
+    # Sort alive by ping_score, dead appended at end
     alive_results.sort(key=lambda r: r.ping_score)
     return alive_results + dead_results
 
@@ -553,7 +512,7 @@ async def geo_lookup_batch(results: list[ProxyResult]) -> None:
         ip = r.proxy.rsplit(":", 1)[0]
         ip_map.setdefault(ip, []).append(r)
     ips = list(ip_map.keys())
-    sem = asyncio.Semaphore(3)   # ip-api.com rate limit: 45 req/min free tier
+    sem = asyncio.Semaphore(3)
 
     async def chunk(ips_chunk: list[str]) -> None:
         payload = [{"query": ip, "fields": "status,countryCode,city,isp,proxy,query"}
@@ -562,13 +521,13 @@ async def geo_lookup_batch(results: list[ProxyResult]) -> None:
             try:
                 async with aiohttp.ClientSession() as s:
                     async with s.post("http://ip-api.com/batch", json=payload,
-                                      timeout=aiohttp.ClientTimeout(total=15)) as r:
+                                     timeout=aiohttp.ClientTimeout(total=15)) as r:
                         if r.status != 200:
                             return
                         for item in await r.json():
                             ip = item.get("query","")
                             if item.get("status") == "success":
-                                cc = item.get("countryCode","")
+                                cc   = item.get("countryCode","")
                                 for res in ip_map.get(ip, []):
                                     res.country      = cc
                                     res.country_flag = FLAGS.get(cc, "🌐")
@@ -632,6 +591,7 @@ def _tier_pool(results: list[ProxyResult], tier: str) -> list[ProxyResult]:
     return [r for r in results if r.alive and r.tier == tier]
 
 def build_txt(results: list[ProxyResult], tier: Optional[str] = None) -> str:
+    """Plain IP:PORT list — one proxy per line, no comments or metadata."""
     pool = [r for r in results if r.alive]
     if tier:
         pool = [r for r in pool if r.tier == tier]
@@ -680,35 +640,42 @@ def make_export(results: list[ProxyResult], fmt: str,
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 def fmt_summary(results: list[ProxyResult], source: str = "") -> str:
-    alive   = [r for r in results if r.alive]
-    dead    = len(results) - len(alive)
-    rate    = len(alive) / len(results) * 100 if results else 0
-    emoji   = "🟢" if rate >= 50 else ("🟡" if rate >= 20 else "🔴")
+    alive = [r for r in results if r.alive]
+    dead  = len(results) - len(alive)
+    rate  = len(alive) / len(results) * 100 if results else 0
+    emoji = "🟢" if rate >= 50 else ("🟡" if rate >= 20 else "🔴")
 
-    times   = [r.response_ms for r in alive if r.response_ms]
-    avg_t   = round(sum(times) / len(times)) if times else 0
-    best_t  = min(times, default=0)
-    worst_t = max(times, default=0)
+    times  = [r.response_ms for r in alive if r.response_ms]
+    avg_t  = round(sum(times) / len(times)) if times else 0
+    best_t = min(times, default=0)
+    worst_t= max(times, default=0)
 
+    # Tier breakdown
     tier_counts = {t[0]: 0 for t in TIERS}
     for r in alive:
         if r.tier in tier_counts:
             tier_counts[r.tier] += 1
     tier_str = "  ".join(
         f"{e}`{n.upper()}:{tier_counts[n]}`"
-        for n, _, e in TIERS if tier_counts.get(n, 0) > 0
+        for n, _, e in TIERS
+        if tier_counts.get(n, 0) > 0
     )
 
+    # Stable vs unstable
     stable_c   = sum(1 for r in alive if r.stable)
     unstable_c = len(alive) - stable_c
-    jitters    = [r.jitter_ms for r in alive if r.jitter_ms is not None]
-    avg_jit    = round(sum(jitters)/len(jitters)) if jitters else 0
 
+    # Jitter avg
+    jitters = [r.jitter_ms for r in alive if r.jitter_ms is not None]
+    avg_jit = round(sum(jitters)/len(jitters)) if jitters else 0
+
+    # Protocol breakdown
     by_proto: dict[str, int] = {}
     for r in alive:
         by_proto[r.protocol] = by_proto.get(r.protocol, 0) + 1
     proto_str = "  ".join(f"`{p.upper()}:{c}`" for p, c in sorted(by_proto.items()))
 
+    # Country top-3
     by_cc: dict[str, tuple[str, int]] = {}
     for r in alive:
         if r.country:
@@ -717,6 +684,7 @@ def fmt_summary(results: list[ProxyResult], source: str = "") -> str:
     top_cc = sorted(by_cc.items(), key=lambda x: -x[1][1])[:3]
     cc_str = "  ".join(f"{f}{cc}:{c}" for cc, (f, c) in top_cc) or "—"
 
+    # Top 5 by ping_score (best overall quality)
     top5 = sorted(alive, key=lambda r: r.ping_score)[:5]
 
     lines = [
@@ -769,6 +737,10 @@ def _bar(done: int, total: int, w: int = 10) -> str:
     f = int(done / total * w) if total else 0
     return "▓" * f + "░" * (w - f)
 
+_USER_SETTINGS: dict[int, UserSettings] = {}
+def get_settings(uid: int) -> UserSettings:
+    return _USER_SETTINGS.setdefault(uid, UserSettings())
+
 # ─── Pipeline ─────────────────────────────────────────────────────────────────
 async def pipeline(
     chat_id: int,
@@ -777,10 +749,11 @@ async def pipeline(
     proxies: list[tuple[str, str]],
     source_label: str,
     settings: UserSettings,
-) -> list[ProxyResult]:   # ✅ Now returns results (v3 returned None)
+) -> None:
     total    = len(proxies)
     start_ts = time.monotonic()
 
+    # Progress callback handles both phases
     async def on_progress(phase: str, done: int, tot: int, alive: int) -> None:
         elapsed = int(time.monotonic() - start_ts)
         if phase == "phase1":
@@ -810,27 +783,32 @@ async def pipeline(
         f"Phase 1: Quick filter `{settings.quick_timeout}s` timeout\n"
         f"Phase 2: `{settings.samples}` ping samples per survivor\n"
         f"Max ping: `{'no limit' if not settings.max_ping else str(settings.max_ping)+'ms'}`\n\n"
-        f"Testing `{total}` proxies... _(⏹ /cancel to stop)_",
+        f"Testing `{total}` proxies...",
     )
 
-    results       = await run_tests(proxies, settings, progress_cb=on_progress)
+    results = await run_tests(proxies, settings, progress_cb=on_progress)
     alive_results = [r for r in results if r.alive]
 
+    # GeoIP
     if settings.geo_lookup and alive_results:
         await safe_edit(status_msg, f"🌍 *GeoIP lookup* for `{len(alive_results)}` proxies...")
         await geo_lookup_batch(results)
 
+    # Summary
     elapsed_total = int(time.monotonic() - start_ts)
-    summary       = fmt_summary(results, source=source_label)
-    summary      += f"\n\n⏱ *Done in* `{elapsed_total}s`"
+    summary = fmt_summary(results, source=source_label)
+    summary += f"\n\n⏱ *Done in* `{elapsed_total}s`"
 
     if not alive_results:
         await safe_edit(status_msg, f"😞 *No working proxies*\n\n{summary}")
-        return results
+        return
 
     await safe_edit(status_msg, summary)
 
+    # ── Export files ───────────────────────────────────────────────
     fmt = settings.export_fmt
+
+    # Always send "all alive" file
     data, fname = make_export(results, fmt, tier=None)
     await context.bot.send_document(
         chat_id=chat_id,
@@ -843,6 +821,7 @@ async def pipeline(
         parse_mode=ParseMode.MARKDOWN,
     )
 
+    # Per-tier files (only tiers that have proxies)
     if settings.tier_export:
         for tier_name, _, tier_emoji in TIERS:
             pool = _tier_pool(results, tier_name)
@@ -860,51 +839,6 @@ async def pipeline(
                 ),
                 parse_mode=ParseMode.MARKDOWN,
             )
-
-    return results
-
-# ─── Cancellable Scan Runner ──────────────────────────────────────────────────
-async def _run_scan(
-    uid: int,
-    chat_id: int,
-    status_msg: Message,
-    context: ContextTypes.DEFAULT_TYPE,
-    proxies: list[tuple[str, str]],
-    label: str,
-    settings: UserSettings,
-    notify_msg: Message,
-) -> None:
-    """
-    Wraps pipeline() in a cancellable asyncio.Task.
-    ✅ Prevents duplicate scans per user.
-    ✅ Stores results in user_data["last_results"] for /top.
-    ✅ Cleans up task reference on finish/cancel.
-    """
-    # Block duplicate scans
-    if uid in _ACTIVE_TASKS and not _ACTIVE_TASKS[uid].done():
-        await notify_msg.reply_text(
-            "⚠️ Scan တစ်ခု Running နေပြီ။\n/cancel နဲ့ ရပ်ပြီးမှ ထပ်လုပ်ပါ"
-        )
-        return
-
-    async def _task_body():
-        try:
-            results = await pipeline(
-                chat_id, status_msg, context, proxies, label, settings
-            )
-            context.user_data["last_results"] = results   # ✅ Always store
-        except asyncio.CancelledError:
-            await safe_edit(status_msg, "⏹ *Scan ရပ်လိုက်ပြီ*")
-            raise
-        finally:
-            _ACTIVE_TASKS.pop(uid, None)   # ✅ Always clean up
-
-    task = asyncio.create_task(_task_body())
-    _ACTIVE_TASKS[uid] = task
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass   # handled inside _task_body
 
 # ─── UI Keyboards ─────────────────────────────────────────────────────────────
 def _main_keyboard() -> InlineKeyboardMarkup:
@@ -973,10 +907,10 @@ def _free_keyboard() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🔙 Back",        callback_data="back:main")])
     return InlineKeyboardMarkup(rows)
 
-# ─── Command Handlers ──────────────────────────────────────────────────────────
+# ─── Handlers ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Proxy Scraper Bot v4*\n"
+        "🤖 *Proxy Scraper Bot v3*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Ping quality-focused proxy scraper\n\n"
         "🚀 *Elite* <200ms  ✅ *Good* <500ms\n"
@@ -984,8 +918,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Two-phase: quick filter → multi-sample ping\n"
         "📉 Jitter tracking (stable vs unstable)\n"
         "🏷 Per-tier export files\n"
-        "📶 Max ping filter\n"
-        "⏹ /cancel — Scan ရပ်ရန်\n\n"
+        "📶 Max ping filter\n\n"
         "URL ကို တိုက်ရိုက်ပို့နိုင်သည် 👇",
         reply_markup=_main_keyboard(), parse_mode=ParseMode.MARKDOWN,
     )
@@ -1000,7 +933,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/top `[N]` — top N fastest proxies (default 10)\n"
         "/free — free source selector\n"
         "/settings — bot settings\n"
-        "/cancel — running scan ရပ်ပါ\n"
         "/help — ဤ message\n\n"
         "📌 *Ping Tiers*\n"
         "🚀 Elite — <200ms (best)\n"
@@ -1011,19 +943,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """✅ New: Cancel any running scan for this user."""
-    uid  = update.effective_user.id
-    task = _ACTIVE_TASKS.get(uid)
-    if task and not task.done():
-        task.cancel()
-        await update.message.reply_text(
-            "⏹ *Scan ရပ်လိုက်ပြီ*", parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        await update.message.reply_text("❌ Running scan မရှိပါ")
-
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show top N proxies from last session (stored in user_data)."""
     n = 10
     if context.args:
         try:
@@ -1033,9 +954,11 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results: list[ProxyResult] = context.user_data.get("last_results", [])
     alive = sorted([r for r in results if r.alive], key=lambda r: r.ping_score)
     if not alive:
-        await update.message.reply_text("❌ No recent results. Run a scan first.")
+        await update.message.reply_text(
+            "❌ No recent results. Run a scan first.",
+        )
         return
-    top   = alive[:n]
+    top = alive[:n]
     lines = [f"🏆 *Top {len(top)} Proxies (by quality)*", "━━━━━━━━━━━━━━━━"]
     for i, r in enumerate(top, 1):
         jit = f" ±{r.jitter_ms}ms" if r.jitter_ms else ""
@@ -1048,7 +971,9 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/scrape <url>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "Usage: `/scrape <url>`", parse_mode=ParseMode.MARKDOWN,
+        )
         return
     await _do_scrape_url(update.message, context, context.args[0])
 
@@ -1081,7 +1006,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d == "back:main":
         await q.edit_message_text(
-            "🤖 *Proxy Scraper Bot v4*\n\nMode ရွေးပါ 👇",
+            "🤖 *Proxy Scraper Bot v3*\n\nMode ရွေးပါ 👇",
             reply_markup=_main_keyboard(), parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -1129,21 +1054,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             proxies = await collect_from_source(name, FREE_SOURCES[name])
             if not proxies:
                 await q.edit_message_text(
-                    f"❌ *{name}* မှ proxy မတွေ့ပါ.\nSource offline ဖြစ်နိုင်သည်။",
+                    f"❌ *{name}* มhub proxy မတွေ့ပါ.\nSource offline ဖြစ်နိုင်သည်။",
                     parse_mode=ParseMode.MARKDOWN,
                 )
                 return
 
-        label      = "All Free Sources" if key == "ALL" else src_keys[int(key)]
-        status_msg = await q.edit_message_text(
+        label = "All Free Sources" if key == "ALL" else src_keys[int(key)]
+        await q.edit_message_text(
             f"✅ `{len(proxies)}` proxies collected from *{label}*\n⚙️ Starting...",
             parse_mode=ParseMode.MARKDOWN,
         )
-        # ✅ Use _run_scan so results are stored for /top (v3 cleared them here)
-        await _run_scan(
-            uid, chat_id, status_msg or q.message,
-            context, proxies, label, settings, q.message,
-        )
+        await pipeline(chat_id, q.message, context, proxies, label, settings)
+        context.user_data["last_results"] = []  # cleared after new scan
 
     elif d == "settings:menu":
         s = get_settings(uid)
@@ -1155,7 +1077,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d == "set:geotoggle":
         s = get_settings(uid)
         s.geo_lookup = not s.geo_lookup
-        save_all_settings()   # ✅ Persist
         await q.edit_message_text(
             _settings_text(s), reply_markup=_settings_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
@@ -1164,7 +1085,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d == "set:tiertoggle":
         s = get_settings(uid)
         s.tier_export = not s.tier_export
-        save_all_settings()   # ✅ Persist
         await q.edit_message_text(
             _settings_text(s), reply_markup=_settings_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
@@ -1173,7 +1093,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d.startswith("set:fmt:"):
         s = get_settings(uid)
         s.export_fmt = d.split(":")[-1]
-        save_all_settings()   # ✅ Persist
         await q.edit_message_text(
             _settings_text(s), reply_markup=_settings_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
@@ -1181,7 +1100,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif d in ("set:timeout","set:quick_timeout","set:samples",
                "set:max_ping","set:concur","set:testurl"):
-        context.user_data["awaiting"] = d[4:]
+        context.user_data["awaiting"] = d[4:]   # strip "set:"
         prompts = {
             "timeout":       "⏱ Full test timeout (3–60s):\nExample: `10`",
             "quick_timeout": "⚡ Phase-1 quick timeout (1–10s):\nExample: `4`",
@@ -1190,8 +1109,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "concur":        "🔀 Concurrency (10–300):\nExample: `100`",
             "testurl":       "🌐 Test URL:\nExample: `http://httpbin.org/ip`",
         }
+        key = d[4:]
         await q.edit_message_text(
-            prompts.get(d[4:], "Enter value:"), parse_mode=ParseMode.MARKDOWN,
+            prompts.get(key, "Enter value:"), parse_mode=ParseMode.MARKDOWN,
         )
 
 # ─── Message Handler ──────────────────────────────────────────────────────────
@@ -1225,19 +1145,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 settings.concur = max(10, min(300, int(val)))
                 await msg.reply_text(f"✅ Concurrency: `{settings.concur}`", parse_mode=ParseMode.MARKDOWN)
             elif awaiting == "testurl":
-                # ✅ Improved: proper regex validation (not just startswith)
-                if re.match(r'^https?://', val):
+                if val.startswith("http"):
                     settings.test_url = val
                     await msg.reply_text(f"✅ Test URL: `{val}`", parse_mode=ParseMode.MARKDOWN)
                 else:
                     await msg.reply_text("❌ http:// or https:// ဖြင့်စပါ")
-                    return   # don't save invalid URL
-            else:
-                return
         except ValueError:
             await msg.reply_text("❌ Invalid value")
-            return
-        save_all_settings()   # ✅ Persist after every settings change
         return
 
     # ── File upload ───────────────────────────────────────────────
@@ -1256,14 +1170,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📂 `{len(proxies)}` proxies found in `{doc.file_name}`\n⚙️ Starting...",
             parse_mode=ParseMode.MARKDOWN,
         )
-        await _run_scan(uid, msg.chat.id, status, context, proxies, doc.file_name, settings, msg)
+        results = await _run_pipeline(msg.chat.id, status, context, proxies, doc.file_name, settings)
+        if results:
+            context.user_data["last_results"] = results
         return
 
     # ── URL ───────────────────────────────────────────────────────
     url_m = re.search(r'https?://\S+', text)
     if url_m or mode == "scrape":
         url = url_m.group(0) if url_m else text.strip()
-        if not re.match(r'^https?://', url):   # ✅ Proper regex validation
+        if not url.startswith("http"):
             await msg.reply_text("❌ http:// or https:// ဖြင့်စသော URL ပေးပါ")
             return
         context.user_data["mode"] = "auto"
@@ -1281,13 +1197,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📋 `{len(proxies)}` proxies detected. Starting ping test...",
             parse_mode=ParseMode.MARKDOWN,
         )
-        await _run_scan(uid, msg.chat.id, status, context, proxies, "Custom List", settings, msg)
+        results = await _run_pipeline(msg.chat.id, status, context, proxies, "Custom List", settings)
+        if results:
+            context.user_data["last_results"] = results
         return
 
     await msg.reply_text(
         "❓ URL သို့မဟုတ် `IP:PORT` list ပေးပါ.\n\nMode ရွေးချယ်ပါ 👇",
         reply_markup=_main_keyboard(), parse_mode=ParseMode.MARKDOWN,
     )
+
+async def _run_pipeline(chat_id, status_msg, context, proxies, label, settings):
+    await pipeline(chat_id, status_msg, context, proxies, label, settings)
+    # Return results stored after pipeline (we re-fetch from bot data)
+    return context.user_data.get("last_results", [])
 
 async def _do_scrape_url(msg: Message, context: ContextTypes.DEFAULT_TYPE, url: str):
     uid      = msg.from_user.id if msg.from_user else 0
@@ -1310,20 +1233,8 @@ async def _do_scrape_url(msg: Message, context: ContextTypes.DEFAULT_TYPE, url: 
         status,
         f"✅ `{len(proxies)}` proxies scraped\n⚡ Starting two-phase ping test...",
     )
-    # ✅ Fixed: use _run_scan so results stored for /top (v3 set last_results=[] here)
-    await _run_scan(uid, msg.chat.id, status, context, proxies, url[:50], settings, msg)
-
-# ─── Global Error Handler ─────────────────────────────────────────────────────
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """✅ New: Log all unhandled exceptions and notify the user."""
-    logger.error("Unhandled exception:", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "❌ Internal error ဖြစ်သွားသည်။ နောက်မှ ထပ်ကြိုးစားပါ။"
-            )
-        except Exception:
-            pass
+    await pipeline(msg.chat.id, status, context, proxies, url[:50], settings)
+    context.user_data["last_results"] = []
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -1333,12 +1244,17 @@ def main() -> None:
         print("    export BOT_TOKEN='your_token_here'")
         return
 
-    load_all_settings()   # ✅ Load persisted settings on startup
-
-    app = Application.builder().token(token).build()
+    # Build inside a fresh event loop for Python 3.10+ / 3.13 compatibility.
+    # PTB's run_polling() manages the loop itself — we must NOT wrap in asyncio.run().
+    # ApplicationBuilder.build() creates asyncio primitives; on Python 3.13 those
+    # require the loop to exist first. Using post_init / run_polling handles this.
+    app = (
+        Application.builder()
+        .token(token)
+        .build()
+    )
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("cancel",   cmd_cancel))   # ✅ New
     app.add_handler(CommandHandler("top",      cmd_top))
     app.add_handler(CommandHandler("scrape",   cmd_scrape))
     app.add_handler(CommandHandler("test",     cmd_test))
@@ -1349,11 +1265,9 @@ def main() -> None:
         (filters.TEXT & ~filters.COMMAND) | filters.Document.ALL,
         on_message,
     ))
-    app.add_error_handler(error_handler)   # ✅ New: global error handler
-
-    print("🤖 Proxy Scraper Bot v4 started")
+    print("🤖 Proxy Scraper Bot v3 started")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 if __name__ == "__main__":
     main()
